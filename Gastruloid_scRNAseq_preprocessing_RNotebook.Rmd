@@ -1,0 +1,1446 @@
+---
+title: "RNotebook: Processing of Gastruloid dataset"
+#author: Stefano Davide Vianello
+#date: 2021
+
+output:
+  html_notebook: 
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: true
+  pdf_document: default
+---
+
+##SETUP PACKAGES AND LIBRARIES, CELL CYCLE ANNOTATIONS
+
+Install the following packages onyour machine, if these have not been installed already
+```{r}
+# install required packages.
+# Note: only need to run this cell if you have never run this code on this machine
+install.packages('Seurat')
+install.packages("devtools")
+devtools::install_github(repo = 'mojaveazure/loomR', ref = 'develop')
+install.packages('tidyverse')
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("AnnotationHub")
+BiocManager::install("ensembldb")
+BiocManager::install('multtest') 
+install.packages('metap')
+
+install.packages("stringr")
+```
+
+Load the libraries required to run this notebook
+
+```{r, verbose=FALSE}
+# Load libraries from installed packages
+# Note: you need to run this cell every time you start a new R session
+library(Seurat)
+library(loomR)
+library(dplyr)
+library(ggplot2)
+
+library(RCurl)
+library(cowplot)
+
+library(AnnotationHub)
+library(ensembldb)
+
+library(purrr)
+library(RColorBrewer)
+
+library(metap)
+
+library(tibble)
+
+library(stringr)
+library(here)
+```
+
+We will also preemptively prepare gene annotations
+
+```{r}
+# Download cell cycle genes for organism at https://github.com/hbc/tinyatlas/tree/master/cell_cycle. Read it in with:
+cell_cycle_genes <- read.csv(file = "E:/Mus_musculus.csv", header = TRUE)
+
+# Connect to AnnotationHub
+ah <- AnnotationHub()
+
+# Access the Ensembl database for organism
+ahDb <- query(ah, 
+              pattern = c("Mus musculus", "EnsDb"), 
+              ignore.case = TRUE)
+
+# Acquire the latest annotation files
+id <- ahDb %>%
+        mcols() %>%
+        rownames() %>%
+        tail(n = 1)
+
+# Download the appropriate Ensembldb database
+edb <- ah[[id]]
+
+# Extract gene-level information from database
+annotations <- genes(edb, 
+                     return.type = "data.frame")
+
+# Select annotations of interest
+annotations <- annotations %>%
+        dplyr::select(gene_id, gene_name, seq_name, gene_biotype, description)
+
+# remove un-needed variables
+rm(ah,ahDb, edb, id)
+
+# Extract IDs for mitochondrial genes
+mt <- annotations %>%
+        dplyr::filter(seq_name == "MT") %>%
+        dplyr::pull(gene_name)
+
+
+# Get gene names for Ensembl IDs for each gene
+cell_cycle_markers <- dplyr::left_join(cell_cycle_genes, annotations, by = c("geneID" = "gene_id"))
+
+# Acquire the S phase genes
+s_genes <- cell_cycle_markers %>%
+        dplyr::filter(phase == "S") %>%
+        pull("gene_name")
+        
+# Acquire the G2M phase genes        
+g2m_genes <- cell_cycle_markers %>%
+        dplyr::filter(phase == "G2/M") %>%
+        pull("gene_name")
+```
+
+Finally, expand the memory size of your machine, to run the more computationally intensive parts of the code:
+```{r}
+#extend memory limit
+memory.limit(size = 10000000000000)
+```
+
+##ASSEMBLE THE RAW COUNT MATRIX: D4
+
+
+```{r}
+# How to read in 10X data for a single sample (output is a sparse matrix)
+# select the path to the folder contain matrix, feature, and barcode compressed filed
+D4b4_counts <- Read10X(data.dir = "E://Rossi/GAS_Day4_batch4")
+
+# Turn count matrix into a Seurat object (output is a Seurat object)
+D4b4_counts <- CreateSeuratObject(counts = D4b4_counts,
+                           min.features = 100)
+
+# Explore the metadata
+head(D4b4_counts@meta.data)
+
+#repeat for the dataset from the other batch
+D4b5_counts <- Read10X(data.dir = "E://Rossi/GAS_Day4_batch5")
+D4b5_counts <- CreateSeuratObject(counts = D4b5_counts,
+                           min.features = 100)
+head(D4b5_counts@meta.data)
+```
+Next, we need to merge these objects together into a single Seurat object. This will make it easier to run the QC steps for both sample groups together and enable us to easily compare the data quality for all the samples.
+
+We can use the merge() function from the Seurat package to do this:
+
+```{r}
+# Create a merged Seurat object
+merged_D4counts <- merge(x = D4b4_counts, 
+                       y = D4b5_counts, 
+                       add.cell.id = c("batch4", "batch5"))
+```
+
+Because the same cell IDs can be used for different samples, we add a sample-specific prefix to each of our cell IDs using the add.cell.id argument. If we look at the metadata of the merged object we should be able to see the prefixes in the rownames:
+
+```{r}
+head(merged_D4counts@meta.data)
+tail(merged_D4counts@meta.data)
+
+rm(D4b4_counts, D4b5_counts)
+```
+
+#### Calculate QC metrics of the data: D4
+
+```{r}
+# Add number of genes per UMI for each cell to metadata
+merged_D4counts$log10GenesPerUMI <- log10(merged_D4counts$nFeature_RNA) / log10(merged_D4counts$nCount_RNA)
+
+# Compute percent mito ratio
+# Number of UMIs assigned to mitochondrial genes
+merged_D4counts$mitoRatio <- PercentageFeatureSet(object = merged_D4counts, pattern = "^mt-")
+merged_D4counts$mitoRatio <- merged_D4counts@meta.data$mitoRatio / 100
+
+# Create metadata dataframe
+metadata <- merged_D4counts@meta.data
+
+# Add cell IDs to metadata
+metadata$cells <- rownames(metadata)
+
+# Rename columns
+metadata <- metadata %>%
+        dplyr::rename(seq_folder = orig.ident,
+                      nUMI = nCount_RNA,
+                      nGene = nFeature_RNA)
+
+# Create sample column
+metadata$sample <- NA
+metadata$sample[which(str_detect(metadata$cells, "^batch4_"))] <- "batch4"
+metadata$sample[which(str_detect(metadata$cells, "^batch5_"))] <- "batch5"
+
+# Add metadata back to Seurat object
+merged_D4counts@meta.data <- metadata
+
+# Create .RData object to load at any time
+#save(merged_D4counts, file="E://Rossi/Processing/D4/merged_D4counts.RData")
+```
+
+
+##ASSEMBLE THE RAW COUNT MATRIX: D5
+
+```{r}
+# How to read in 10X data for a single sample (output is a sparse matrix)
+# select the path to the folder contain matrix, feature, and barcode compressed filed
+D5b3_counts <- Read10X(data.dir = "E://Rossi/GAS_Day5_batch3")
+
+# Turn count matrix into a Seurat object (output is a Seurat object)
+D5b3_counts <- CreateSeuratObject(counts = D5b3_counts,
+                           min.features = 100)
+
+# Explore the metadata
+head(D5b3_counts@meta.data)
+
+#repeat for the dataset from the other batch
+D5b4_counts <- Read10X(data.dir = "E://Rossi/GAS_Day5_batch4")
+D5b4_counts <- CreateSeuratObject(counts = D5b4_counts,
+                           min.features = 100)
+head(D5b4_counts@meta.data)
+```
+Next, we need to merge these objects together into a single Seurat object. This will make it easier to run the QC steps for both sample groups together and enable us to easily compare the data quality for all the samples.
+
+We can use the merge() function from the Seurat package to do this:
+
+```{r}
+# Create a merged Seurat object
+merged_D5counts <- merge(x = D5b3_counts, 
+                       y = D5b4_counts, 
+                       add.cell.id = c("batch3", "batch4"))
+```
+
+Because the same cell IDs can be used for different samples, we add a sample-specific prefix to each of our cell IDs using the add.cell.id argument. If we look at the metadata of the merged object we should be able to see the prefixes in the rownames:
+
+```{r}
+head(merged_D5counts@meta.data)
+tail(merged_D5counts@meta.data)
+
+rm(D5b3_counts, D5b4_counts)
+```
+
+#### Calculate QC metrics of the data: D5
+
+```{r}
+# Add number of genes per UMI for each cell to metadata
+merged_D5counts$log10GenesPerUMI <- log10(merged_D5counts$nFeature_RNA) / log10(merged_D5counts$nCount_RNA)
+
+# Compute percent mito ratio
+# Number of UMIs assigned to mitochondrial genes
+merged_D5counts$mitoRatio <- PercentageFeatureSet(object = merged_D5counts, pattern = "^mt-")
+merged_D5counts$mitoRatio <- merged_D5counts@meta.data$mitoRatio / 100
+
+# Create metadata dataframe
+metadata <- merged_D5counts@meta.data
+
+# Add cell IDs to metadata
+metadata$cells <- rownames(metadata)
+
+# Rename columns
+metadata <- metadata %>%
+        dplyr::rename(seq_folder = orig.ident,
+                      nUMI = nCount_RNA,
+                      nGene = nFeature_RNA)
+
+# Create sample column
+metadata$sample <- NA
+metadata$sample[which(str_detect(metadata$cells, "^batch3_"))] <- "batch3"
+metadata$sample[which(str_detect(metadata$cells, "^batch4_"))] <- "batch4"
+
+# Add metadata back to Seurat object
+merged_D5counts@meta.data <- metadata
+                           
+# Create .RData object to load at any time
+#save(merged_D5counts, file="E://Rossi/Processing/merged_D5counts.RData")
+
+```
+
+##ASSEMBLE THE RAW COUNT MATRIX: D6
+
+```{r}
+# How to read in 10X data for a single sample (output is a sparse matrix)
+# select the path to the folder contain matrix, feature, and barcode compressed files
+D6b2_counts <- Read10X(data.dir = "D://Rossi/GAS_Day6_batch2")
+
+# Turn count matrix into a Seurat object (output is a Seurat object)
+D6b2_counts <- CreateSeuratObject(counts = D6b2_counts,
+                           min.features = 100)
+
+# Explore the metadata
+head(D6b2_counts@meta.data)
+
+#repeat for the dataset from the other batch
+D6b3_counts <- Read10X(data.dir = "D://Rossi/GAS_Day6_batch3")
+D6b3_counts  <- CreateSeuratObject(counts = D6b3_counts ,
+                           min.features = 100)
+head(D6b3_counts @meta.data)
+```
+Next, we need to merge these objects together into a single Seurat object. This will make it easier to run the QC steps for both sample groups together and enable us to easily compare the data quality for all the samples.
+
+We can use the merge() function from the Seurat package to do this:
+
+```{r}
+# Create a merged Seurat object
+merged_D6counts <- merge(x = D6b2_counts, 
+                       y = D6b3_counts, 
+                       add.cell.id = c("batch2", "batch3"))
+```
+
+Because the same cell IDs can be used for different samples, we added a sample-specific prefix to each of our cell IDs using the add.cell.id argument. If we look at the metadata of the merged object we should be able to see the prefixes in the rownames:
+
+```{r}
+head(merged_D6counts@meta.data)
+tail(merged_D6counts@meta.data)
+
+rm(D6b2_counts, D6b3_counts)
+```
+
+#### Calculate QC metrics of the data: D6
+
+```{r}
+# Add number of genes per UMI for each cell to metadata
+merged_D6counts$log10GenesPerUMI <- log10(merged_D6counts$nFeature_RNA) / log10(merged_D6counts$nCount_RNA)
+
+# Compute percent mito ratio
+# Number of UMIs assigned to mitochondrial genes
+merged_D6counts$mitoRatio <- PercentageFeatureSet(object = merged_D6counts, pattern = "^mt-")
+merged_D6counts$mitoRatio <- merged_D6counts@meta.data$mitoRatio / 100
+
+# Create metadata dataframe
+metadata <- merged_D6counts@meta.data
+
+# Add cell IDs to metadata
+metadata$cells <- rownames(metadata)
+
+# Rename columns
+metadata <- metadata %>%
+        dplyr::rename(seq_folder = orig.ident,
+                      nUMI = nCount_RNA,
+                      nGene = nFeature_RNA)
+
+# Create sample column
+metadata$sample <- NA
+metadata$sample[which(str_detect(metadata$cells, "^batch2_"))] <- "batch2"
+metadata$sample[which(str_detect(metadata$cells, "^batch3_"))] <- "batch3"
+
+# Add metadata back to Seurat object
+merged_D6counts@meta.data <- metadata
+                           
+# Create .RData object to load at any time
+#save(merged_D6counts, file="E://Rossi/Processing/D6/merged_D6counts.RData")
+
+```
+
+##ASSEMBLE THE RAW COUNT MATRIX: D7
+
+```{r}
+# How to read in 10X data for a single sample (output is a sparse matrix)
+# select the path to the folder contain matrix, feature, and barcode compressed filed
+D7b1_counts <- Read10X(data.dir = "D://Rossi/GAS_Day7_batch1")
+
+# Turn count matrix into a Seurat object (output is a Seurat object)
+D7b1_counts <- CreateSeuratObject(counts = D7b1_counts,
+                           min.features = 100)
+
+# Explore the metadata
+head(D7b1_counts@meta.data)
+
+#repeat for the dataset from the other batch
+D7b2_counts <- Read10X(data.dir = "D://Rossi/GAS_Day7_batch2")
+D7b2_counts <- CreateSeuratObject(counts = D7b2_counts,
+                           min.features = 100)
+head(D7b2_counts@meta.data)
+```
+Next, we need to merge these objects together into a single Seurat object. This will make it easier to run the QC steps for both sample groups together and enable us to easily compare the data quality for all the samples.
+
+We can use the merge() function from the Seurat package to do this:
+
+```{r}
+# Create a merged Seurat object
+merged_D7counts <- merge(x = D7b1_counts, 
+                       y = D7b2_counts, 
+                       add.cell.id = c("batch1", "batch2"))
+```
+
+Because the same cell IDs can be used for different samples, we add a sample-specific prefix to each of our cell IDs using the add.cell.id argument. If we look at the metadata of the merged object we should be able to see the prefixes in the rownames:
+
+```{r}
+head(merged_D7counts@meta.data)
+tail(merged_D7counts@meta.data)
+
+rm(D7b1_counts, D7b2_counts)
+```
+
+#### Calculate QC metrics of the data: D7
+
+```{r}
+# Add number of genes per UMI for each cell to metadata
+merged_D7counts$log10GenesPerUMI <- log10(merged_D7counts$nFeature_RNA) / log10(merged_D7counts$nCount_RNA)
+
+# Compute percent mito ratio
+# Number of UMIs assigned to mitochondrial genes
+merged_D7counts$mitoRatio <- PercentageFeatureSet(object = merged_D7counts, pattern = "^mt-")
+merged_D7counts$mitoRatio <- merged_D7counts@meta.data$mitoRatio / 100
+
+# Create metadata dataframe
+metadata <- merged_D7counts@meta.data
+
+# Add cell IDs to metadata
+metadata$cells <- rownames(metadata)
+
+# Rename columns
+metadata <- metadata %>%
+        dplyr::rename(seq_folder = orig.ident,
+                      nUMI = nCount_RNA,
+                      nGene = nFeature_RNA)
+
+# Create sample column
+metadata$sample <- NA
+metadata$sample[which(str_detect(metadata$cells, "^batch1_"))] <- "batch1"
+metadata$sample[which(str_detect(metadata$cells, "^batch2_"))] <- "batch2"
+
+# Add metadata back to Seurat object
+merged_D7counts@meta.data <- metadata
+                           
+# Create .RData object to load at any time
+#save(merged_D7counts, file="E://Rossi/Processing/D7/merged_D7counts.RData")
+
+```
+
+--------------------------------------------------
+##ASSEMBLE THE RAW COUNT MATRIX (D4, D5, D6, D7)
+
+```{r}
+# load the seurat objects for each of the timepoints
+#this is the raw seurat, with calculated QC metrics, two merged batches
+
+# load the D4 seurat object
+load("E://Rossi/Processing/D4/merged_D4counts.RData") 
+# load the D5 seurat object
+load("E://Rossi/Processing/D5/merged_D5counts.RData")
+# load the D6 seurat object
+load("E://Rossi/Processing/D6/merged_D6counts.RData") 
+# load the D7 seurat object
+load("E://Rossi/Processing/D7/merged_D7counts.RData")
+
+# Create a merged Seurat object (seems to need to go pair by pair)
+merged_D4D5counts <- merge(x = merged_D4counts, 
+                       y = merged_D5counts, 
+                       add.cell.id = c("D4", "D5"))
+
+merged_D6D7counts <- merge(x = merged_D6counts, 
+                       y = merged_D7counts, 
+                       add.cell.id = c("D6", "D7"))
+
+merged_counts <- merge(x = merged_D4D5counts, 
+                       y = merged_D6D7counts)
+
+# Because the same cell IDs can be used for different samples, we added a sample-specific prefix to each of our cell IDs using the add.cell.id argument. If we look at the metadata of the merged object we should be able to see the prefixes in the rownames
+
+#save(merged_counts, file = "E://Rossi/Processing/D4D5D6D7/merged_D4D5D6D7counts.RData")
+
+#the steps above (merging of each timepoint) were done on the HPC cluster. Load the output
+load("E://Rossi/Processing/D4D5D6D7/merged_D4D5D6D7counts.RData") #this is a 4.3GB file
+
+#check that everything worked out and timepoint prefixes have been addedd to cell name
+head(merged_counts@meta.data)
+tail(merged_counts@meta.data)
+```
+
+#### QUALITY CONTROL (D4,D5,D6,D7)
+
+
+```{r}
+# Create metadata dataframe
+metadata <- merged_counts@meta.data
+
+# Add new cell IDs to metadata
+metadata$cells <- rownames(metadata)
+
+# Make new sample category (day)
+metadata$day <- NA
+metadata$day[which(str_detect(metadata$cells, "^D4_"))] <- "D4"
+metadata$day[which(str_detect(metadata$cells, "^D5_"))] <- "D5"
+metadata$day[which(str_detect(metadata$cells, "^D6_"))] <- "D6"
+metadata$day[which(str_detect(metadata$cells, "^D7_"))] <- "D7"
+
+# Add metadata back to Seurat object
+merged_counts@meta.data <- metadata
+```
+
+#### EXPLORE QC METRICS OF THE DATA (D4,D5,D6,D7)
+
+```{r}
+# set current sample identitiy to be that of the day
+Idents(object=merged_counts) <- "day"
+
+#Plot key QC parameters
+VlnPlot(merged_counts, features = c("nUMI", "nGene", "mitoRatio"), ncol = 3,  pt.size = 0.25)
+```
+
+
+```{r}
+#See number of cells per sample
+metadata %>% 
+  	ggplot(aes(x=day, fill=day)) + 
+  	geom_bar(stat="count") +
+    stat_count(geom = "text", colour = "white", size = 5, aes(label = ..count..),position=position_stack(vjust=0.5))+
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells")
+```
+
+```{r}
+# Visualize the number UMIs/transcripts per cell
+metadata %>% 
+  	ggplot(aes(color=day, x=nUMI, fill= day)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	ylab("Cell density") +
+  	geom_vline(xintercept = 10000)
+
+#UMI counts (transcripts) per cell
+#The UMI counts per cell should generally be above 500, that is the low end of what we expect. If UMI counts are #between 500-1000 counts, it is usable but the cells probably should have been sequenced more deeply.
+```
+
+```{r}
+# Visualize the distribution of genes detected per cell via histogram
+metadata %>% 
+  	ggplot(aes(color=day, x=nGene, fill= day)) + 
+  	geom_density(alpha = 0.2) + 
+  	theme_classic() +
+  	scale_x_log10() + 
+  	geom_vline(xintercept = 2000)
+```
+
+```{r}
+# Visualize the distribution of genes detected per cell via boxplot
+metadata %>% 
+  	#ggplot(aes(x=sample, y=log10(nGene), fill=sample)) +
+    ggplot(aes(x=day, y=nGene, fill=day)) +
+  	geom_boxplot() + 
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells vs NGenes")
+
+#We have similar expectations for gene detection as for UMI detection, although it may be a bit lower than UMIs. For high quality data, the proportional histogram should contain a single large peak that represents cells that were encapsulated. If we see a small shoulder to the right of the major peak (not present in our data), or a bimodal distribution of the cells, that can indicate a couple of things. It might be that there are a set of cells that failed for some reason. It could also be that there are biologically different types of cells (i.e. quiescent cell populations, less complex cells of interest), and/or one type is much smaller than the other (i.e. cells with high counts may be cells that are larger in size). Therefore, this threshold should be assessed with other metrics that we describe in this lesson.
+```
+
+```{r}
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+metadata %>% 
+  	ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  	geom_point() + 
+	scale_colour_gradient(low = "gray90", high = "black") +
+  	stat_smooth(method=lm) +
+  	scale_x_log10() + 
+  	scale_y_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 10000) +
+  	geom_hline(yintercept = 2000) +
+  	facet_wrap(~day)
+
+#UMIs vs. genes detected
+#Two metrics that are often evaluated together are the number of UMIs and the number of genes detected per cell. Here, we have plotted the number of genes versus the numnber of UMIs coloured by the fraction of mitochondrial reads. Mitochondrial read fractions are only high (light blue color) in particularly low count cells with few detected genes. This could be indicative of damaged/dying cells whose cytoplasmic mRNA has leaked out through a broken membrane, and thus, only mRNA located in the mitochondria is still conserved. These cells are filtered out by our count and gene number thresholds. Jointly visualizing the count and gene thresholds shows the joint filtering effect.
+
+#Cells that are poor quality are likely to have low genes and UMIs per cell, and correspond to the data points in the bottom left quadrant of the plot. Good cells will generally exhibit both higher number of genes per cell and higher numbers of UMIs.
+
+#With this plot we also evaluate the slope of the line, and any scatter of data points in the bottom right hand quadrant of the plot. These cells have a high number of UMIs but only a few number of genes. These could be dying cells, but also could represent a population of a low complexity celltype (i.e red blood cells).
+```
+```{r}
+# Visualize the distribution of mitochondrial gene expression detected per cell
+metadata %>% 
+  	ggplot(aes(color=day, x=mitoRatio, fill=day)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 0.15)
+
+#Mitochondrial counts ratio
+#This metric can identify whether there is a large amount of mitochondrial contamination from dead or dying cells. We define poor quality samples for mitochondrial counts as cells which surpass the 0.2 mitochondrial ratio mark, unless of course you are expecting this in your sample
+```
+
+```{r}
+# Visualize the overall complexity of the gene expression by visualizing the genes detected per UMI
+metadata %>%
+  	ggplot(aes(x=(log10(metadata$nGene) / log10(metadata$nUMI)), color = day, fill=day)) +
+  	geom_density(alpha = 0.2) +
+  	theme_classic() +
+  	geom_vline(xintercept = 0.75)
+
+#Complexity
+#We can see the samples where we sequenced each cell less have a higher overall complexity, that is because we have not started saturating the sequencing for any given gene for these samples. Outlier cells in these samples might be cells that have a less complex RNA species than other cells. Sometimes we can detect contamination with low complexity cell types like red blood cells via this metric. Generally, we expect the novelty score to be above 0.80.
+```
+
+#### FILTER OUT DATA BASED ON QC METRICS (D4,D5,D6,D7)
+
+
+```{r}
+# Filter out low quality reads using selected thresholds - these will change with experiment
+filtered_seurat <- subset(x = merged_counts, 
+                         subset= (nUMI >= 10000) & 
+                           (nGene >= 2000) & 
+                           ((log10(metadata$nGene) / log10(metadata$nUMI)) > 0.75) & 
+                           (mitoRatio < 0.15))
+
+# Create .RData object to load at any time
+#save(filtered_seurat, file="D://Rossi/Processing/D4D5D6D7/QCfiltered_D4D5D6D7_counts.RData")
+#load("D://Rossi/Processing/D4D5D6D7/QCfiltered_D4D5D6D7_counts.RData") #loads object "filtered_seurat" of size 4GB
+```
+
+#### ASSESS CONSEQUENCES OF FILTERING OUT
+
+```{r}
+# check number of cells in each stage
+filtered_seurat@meta.data %>% 
+  	ggplot(aes(x=day, fill=day)) + 
+  	geom_bar(stat="count") +
+    stat_count(geom = "text", colour = "white", size = 5, aes(label = ..count..),position=position_stack(vjust=0.5))+
+    theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells")
+
+```
+
+```{r}
+#Plot key QC metrics
+VlnPlot(filtered_seurat, features = c("nGene", "nUMI", "mitoRatio"), ncol = 3,  pt.size = 0.25)
+```
+
+```{r}
+##Within our data we will have many genes with zero counts. These genes can dramatically reduce the average expression for a cell and so we will remove them from our data. First we will remove genes that have zero expression in all cells. Additionally, we will perform some filtering by prevalence. If a gene is only expressed in a handful of cells, it is not particularly meaningful as it still brings down the averages for all other cells it is not expressed in. For our data we choose to keep only genes which are expressed in 5 or more cells.
+
+# Output a logical vector for every gene on whether the more than zero counts per cell
+# Extract counts
+counts <- GetAssayData(object = filtered_seurat, slot = "counts")
+
+# Output a logical vector for every gene on whether the more than zero counts per cell
+nonzero <- counts > 0
+
+# Sums all TRUE values and returns TRUE if more than 5 TRUE values per gene
+keep_genes <- Matrix::rowSums(nonzero) >= 5
+
+# Only keeping those genes expressed in more than 5 cells
+filtered_counts <- counts[keep_genes, ]
+
+# Reassign to filtered Seurat object
+filtered_seurat <- CreateSeuratObject(filtered_counts, meta.data = filtered_seurat@meta.data)
+```
+
+```{r}
+##Final reassessment of QC metrics
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+filtered_seurat@meta.data %>% 
+  	ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  	geom_point() + 
+	scale_colour_gradient(low = "gray90", high = "black") +
+  	stat_smooth(method=lm) +
+  	scale_x_log10() + 
+  	scale_y_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 10000) +
+  	geom_hline(yintercept = 2000) +
+  	facet_wrap(~day)
+```
+```{r}
+# Create .RData object to load at any time
+#save(filtered_seurat, file="E://Rossi/Processing/D4D5D6D7/QCfiltered_D4D5D6D7_counts.RData") #overwrites previous instance
+#load("E://Rossi/Processing/D4D5D6D7/QCfiltered_D4D5D6D7_counts.RData") #loads object "filtered_seurat" of size 4GB
+```
+
+#### Normalization, variance stabilization, and regression of unwanted variation for each sample
+
+```{r}
+# NOTE: from the analysis of each single dataset I already know that I need to regress cell cycle score.
+# I will not repeat it here for the combined dataset but the code in this chunck would allow to check whether cells separarte based on cell cycle phase
+
+#Cell cycle scoring
+################
+#It is recommended to check the cell cycle phase before performing the sctransform method. Since the counts need to be comparable between cells and each cell has a different number of total UMIs, we do a rough normalization by dividing by total counts per cell and taking the natural log. This method isn't as accurate as the sctransform method that we will use ultimately to identify cell clusters, but it is sufficient to explore sources of variation in our data.
+
+# Normalize the counts
+seurat_phase <- NormalizeData(filtered_seurat)
+
+# Perform cell cycle scoring (assumes you have extracted S and G2M features, see SETUP section)
+seurat_phase <- CellCycleScoring(filtered_seurat,
+                                   g2m.features = g2m_genes,
+                                   s.features = s_genes)
+
+# View cell cycle scores and phases assigned to cells  (now has cell ceycle scores)                               
+View(seurat_phase@meta.data)      
+
+#now we will lunch a very basic full analysis pipeline to see how phase differentiates cells
+# Identify the most variable genes
+seurat_phase <- FindVariableFeatures(seurat_phase, 
+                     selection.method = "vst",
+                     nfeatures = 2000, 
+                     verbose = FALSE)
+
+# Scale the counts
+seurat_phase <- ScaleData(seurat_phase)
+
+# Perform PCA
+seurat_phase <- RunPCA(seurat_phase)
+
+# Plot the PCA colored by cell cycle phase
+DimPlot(seurat_phase,
+        reduction = "pca",
+        group.by= "Phase",
+        split.by = "Phase"
+        )
+
+#Possible outputs:
+#A -We do not see large differences due to cell cycle phase. Based on this plot, we would not regress out the variation due to cell cycle.
+
+#B- We do see differences on PC1, with the G1 cells to the left of the other cells on PC1. Based on this plot, we would regress out the variation due to cell cycle.
+
+# Note how in this dataset there is not much difference between samples, but big difference within it (do not cluster nicely). Indeed if you follow up without cell cycle integration you will see clustering with big differences in score.
+
+#NOTE: Alternatively, we could wait and perform the clustering without regression and see if we have clusters separated by cell cycle phase. If we do, then we could come back and perform the regression.
+
+# Create .RData object to load at any time
+#save(seurat_phase, file="D://Rossi/Processing/D4D5/QCd_phased_D4D5counts.RData")
+#load("D://Rossi/Processing/D4D5/QCd_phased_D4D5counts.RData")
+
+```
+
+
+```{r}
+#Normalisation, stabilisaiton, regression: SCTransform
+################
+#Now we can use the sctransform method as a more accurate method of normalizing, estimating the variance of the raw filtered data, and identifying the most variable genes. By default, sctransform accounts for cellular sequencing depth, or nUMIs. We already checked cell cycle and decided that it didn't represent a major source of variation in our data, but mitochondrial expression is another factor which can greatly influence clustering. Oftentimes, it is useful to regress out variation due to mitochondrial expression. However, if the differences in mitochondrial gene expression represent a biological phenomenon that may help to distinguish cell clusters, then we advise not regressing the mitochondrial expression.
+
+# do these steps on the dataset
+sct_seurat <- NormalizeData(filtered_seurat, verbose = TRUE)
+sct_seurat <- CellCycleScoring(sct_seurat, g2m.features=g2m_genes, s.features=s_genes)
+
+# run sctransform (we are gere regressing CELL CYCLE PHASE and MITORATIO)
+sct_seurat <- SCTransform(sct_seurat, vars.to.regress = c("mitoRatio", "S.Score", "G2M.Score"), verbose = FALSE)
+
+##Visualise dataset on UMAP
+# These are now standard steps in the Seurat workflow for visualization and clustering
+sct_seurat  <- RunPCA(sct_seurat , verbose = FALSE)
+sct_seurat  <- RunUMAP(sct_seurat , dims = 1:30, verbose = FALSE)
+
+sct_seurat  <- FindNeighbors(sct_seurat , dims = 1:30, verbose = FALSE)
+sct_seurat  <- FindClusters(sct_seurat , verbose = FALSE)
+
+# The steps above where done on the HPC cluster. Load the output:
+load("E://Rossi/Processing/D4D5D6D7/D4D5D6D7_sct_HPCoutput.RData") #loads "sct_seurat" object of size 8.7GB
+
+
+DimPlot(sct_seurat , label = TRUE, group.by = "day")
+```
+
+```{r}
+DimPlot(sct_seurat, group.by = "day", cols = c("firebrick1", "gray35", "gray35", "gray35")) +labs(title = "UMAP (separated by batch)")
+
+DimPlot(sct_seurat, group.by = "day", cols = c("gray35", "firebrick1", "gray35", "gray35")) +labs(title = "UMAP (separated by batch)")
+
+DimPlot(sct_seurat, group.by = "day", cols = c("gray35", "gray35", "firebrick1", "gray35")) +labs(title = "UMAP (separated by batch)")
+
+DimPlot(sct_seurat, group.by = "day", cols = c("gray35", "gray35", "gray35", "firebrick1")) +labs(title = "UMAP (separated by batch)")
+```
+In this case, the two batches do not overlap well, we need to integrate based on shared features
+
+##### INTEGRATION
+
+```{r, fig.width=10, fig.height=6}
+#If the cells cluster by sample, condition, dataset, or modality, this step can greatly improve your clustering and your downstream analyses. It can help to first run conditions individually if unsure what clusters to expect or expecting some different cell types between conditions (e.g. tumor and control samples), then run them together to see whether there are condition-specific clusters for cell types present in both conditions. Oftentimes, when clustering cells from multiple conditions there are condition-specific clusters and integration can help ensure the same cell types cluster together.
+
+# Split seurat object by condition to perform cell cycle scoring and SCT on all samples
+split_seurat <- SplitObject(filtered_seurat, split.by = "day")
+split_seurat <- split_seurat[c("D4", "D5", "D6", "D7")]
+
+
+# Create .RData object to load at any time
+#save(split_seurat, file="D://Rossi/Processing/D4D5D6D7/D4D5D6D7_split_for_integration.RData")
+#load("D://Rossi/Processing/D4D5D6D7/D4D5D6D7_split_for_integration.RData")
+
+for (i in 1:length(split_seurat)) {
+    split_seurat[[i]] <- NormalizeData(split_seurat[[i]], verbose = TRUE)
+    split_seurat[[i]] <- CellCycleScoring(split_seurat[[i]], g2m.features=g2m_genes, s.features=s_genes)
+    split_seurat[[i]] <- SCTransform(split_seurat[[i]], vars.to.regress = c("mitoRatio", "S.Score", "G2M.Score"), verbose = FALSE)
+}
+
+# Check which assays are stored in objects
+#split_seurat$D4@assays
+
+#Now we can see that in addition to the raw RNA counts, we now have a SCT component in our assays slot. The most variable features will be the only genes stored inside the SCT assay. As we move through the scRNA-seq analysis, we will choose the most appropriate assay to use for the different steps in the analysis.
+
+#Generally, we always look at our cells before deciding whether we need to perform integration. If we had performed the normalization on both conditions together in a Seurat object and visualized the similarity between cells, we would have seen condition-specific clustering (see steps above)
+
+###
+
+#To integrate, we will use the shared highly variable genes from each condition identified using SCTransform, then, we will "integrate" or "harmonize" the conditions to overlay cells that are similar or have a "common set of biological features" between groups.
+
+#Now, using our SCTransform object as input, let's perform the integration across conditions.
+
+#First, we need to specify that we want to use all of the 3000 most variable genes identified by SCTransform for the integration. By default, this function only selects the top 2000 genes.
+
+# Select the most variable features to use for integration
+integ_features <- SelectIntegrationFeatures(object.list = split_seurat, nfeatures = 3000) 
+
+# Prepare the SCT list object for integration
+integrated_seurat <- PrepSCTIntegration(object.list = split_seurat, anchor.features = integ_features)
+
+# Find best buddies - can take a while to run (will say 0% even when running)
+integ_anchors <- FindIntegrationAnchors(object.list = integrated_seurat, 
+                                        normalization.method = "SCT", 
+                                        anchor.features = integ_features,
+                                        k.filter = 200) # this value cannot be higher than the lower cell number in either sample
+
+# Integrate across conditions
+seurat_integrated <- IntegrateData(anchorset = integ_anchors, 
+                                   normalization.method = "SCT")
+
+## We will now process this new, integrated, object as usual
+
+# Run PCA
+seurat_integrated <- RunPCA(object = seurat_integrated)
+
+# Run UMAP
+seurat_integrated <- RunUMAP(seurat_integrated, 
+                             dims = 1:40,reduction = "pca")
+
+
+#all the steps above were done on the HPC cluster. Load output file:
+load("E://Rossi/Processing/D4D5D6D7/D4D5D6D7_integrated.RData") #loads "seurat_integrated" file, of size 10.5GB
+
+
+# Plot PCA
+PCAPlot(seurat_integrated,
+        split.by = "day", group.by= "day") 
+
+
+# Color by sample (batch) to check that they now do not separate anymore
+DimPlot(seurat_integrated, group.by = "day", cols = c("firebrick1", "gray35", "gray35", "gray35")) +labs(title = "UMAP (separated by batch)")
+
+DimPlot(seurat_integrated, group.by = "day", cols = c("gray35", "firebrick1", "gray35", "gray35")) +labs(title = "UMAP (separated by batch)")
+
+DimPlot(seurat_integrated, group.by = "day", cols = c("gray35", "gray35", "firebrick1", "gray35")) +labs(title = "UMAP (separated by batch)")
+
+DimPlot(seurat_integrated, group.by = "day", cols = c("gray35", "gray35", "gray35", "firebrick1")) +labs(title = "UMAP (separated by batch)")
+
+```
+
+
+#### CLUSTERING
+We can now cluster the dataset
+
+```{r}
+#https://github.com/hbctraining/scRNA-seq/blob/master/lessons/07_SC_clustering_cells_SCT.md
+
+# Explore heatmap of PCs
+DimHeatmap(seurat_integrated, 
+           dims = 1:9, 
+           cells = 500, 
+           balanced = TRUE)
+
+# Printing out the most variable genes driving PCs
+print(x = seurat_integrated[["pca"]], 
+      dims = 1:10, 
+      nfeatures = 5)
+
+# Plot the elbow plot
+ElbowPlot(object = seurat_integrated, 
+          ndims = 60)
+```
+
+```{r}
+##
+# Determine the K-nearest neighbor graph
+# only run if you want to use more of the 30 dims used before
+seurat_integrated <- FindNeighbors(object = seurat_integrated, 
+                                dims = 1:40)
+
+# Determine the clusters for various resolutions                                
+seurat_integrated <- FindClusters(object = seurat_integrated,
+                               resolution = c(0.4, 0.6, 0.8, 1.0, 1.2, 1.3, 1.4, 2.0))
+
+# Assign identity of clusters (i.e. choose which resolution to consider)
+Idents(object = seurat_integrated) <- "integrated_snn_res.0.8" #check the object metadata to know this label
+```
+
+```{r}
+# Plot the UMAP (based on resolution set one step above)
+
+#the two-step plotting is required to be able to get white cluster labels, otherwise they stay black (if using DarkTheme)
+plot <- DimPlot(seurat_integrated,
+        reduction = "umap",
+        label = F,
+        label.size = 6,
+        ) +labs(title = "UMAP with resolution 0.8")
+ 
+LabelClusters(plot = plot, id = "ident", color = "black", size = 4)
+```
+
+
+```{r}
+# Create .RData object to load at any time
+#save(seurat_integrated, file="D://Rossi/Processing/D4D5D6D7/D4D5D6D7counts_final_integrated_clustered.RData")
+#load("E://Rossi/Processing/D4D5D6D7/D4D5D6D7counts_final_integrated_clustered.RData") #10.5GB
+```
+
+##### EXPLORE CLUSTERS
+
+```{r}
+# Extract identity and sample information from seurat object to determine the number of cells per cluster per sample
+n_cells <- FetchData(seurat_integrated, 
+                     vars = c("ident", "day")) %>%
+        dplyr::count(ident, day) %>%
+        tidyr::spread(ident, n)
+
+# View table
+View(n_cells)
+
+# UMAP of cells in each cluster by sample
+DimPlot(seurat_integrated, 
+        label = TRUE, 
+        split.by = "day")  + NoLegend()
+
+# Explore whether clusters segregate by cell cycle phase
+DimPlot(seurat_integrated,
+        label = TRUE, 
+        split.by = "Phase")  + NoLegend()
+
+#Next we can explore whether the cells cluster by the different cell cycle phases. We did not regress out variation due to cell cycle phase when we performed the SCTransform normalization and regression of uninteresting sources of variation. If our cell clusters showed large differences in mitochondrial expression, this would be an indication we would want to re-run the SCTransform and add the S.Score and G2M.Score to our variables to regress, then re-run the rest of the steps.
+```
+
+```{r}
+##Segregation of clusters by various sources of uninteresting variation
+
+# Determine metrics to plot present in seurat_integrated@meta.data
+#metrics <-  c("nCount_RNA", "nFeature_RNA", "S.Score", "G2M.Score", "X_Mitochondrial_Content")
+metrics <-  c("nUMI", "nGene")
+metrics <-  c("S.Score", "G2M.Score")
+metrics <-  c("mitoRatio")
+
+# and to visualise them run UMAP
+FeaturePlot(seurat_integrated, 
+            reduction = "umap", 
+            features = metrics,
+            pt.size = 0.4, 
+            order = TRUE,
+            min.cutoff = 'q10',
+            label = TRUE)
+#could you inprove by going back at the regression step and choose additional features to regress out?
+```
+
+
+```{r, fig.width = 14,  fig.height = 10}
+#Exploration of the PCs driving the different clusters
+#We can also explore how well our clusters separate by the different PCs; we hope that the defined PCs separate the cell types well. To visualize this information, we need to extract the UMAP coordinate information for the cells along with their corresponding scores for each of the PCs to view by UMAP.
+
+#First, we identify the information we would like to extract from the Seurat object, then, we can use the FetchData() function to extract it.
+
+# Defining the information in the seurat object of interest
+columns <- c(paste0("PC_", 1:16),
+            "ident",
+            "UMAP_1", "UMAP_2")
+
+# Extracting this data from the seurat object
+pc_data <- FetchData(seurat_integrated, 
+                     vars = columns)
+
+# Adding cluster label to center of cluster on UMAP
+umap_label <- FetchData(seurat_integrated, 
+                        vars = c("ident", "UMAP_1", "UMAP_2"))  %>%
+  group_by(ident) %>%
+  summarise(x=mean(UMAP_1), y=mean(UMAP_2))
+  
+# Plotting a UMAP plot for each of the PCs
+map(paste0("PC_", 1:16), function(pc){
+        ggplot(pc_data, 
+               aes(UMAP_1, UMAP_2)) +
+                geom_point(aes_string(color=pc), 
+                           alpha = 0.7) +
+                scale_color_gradient(guide = FALSE, 
+                                     low = "grey90", 
+                                     high = "blue")  +
+                geom_text(data=umap_label, 
+                          aes(label=ident, x, y)) +
+                ggtitle(pc)
+}) %>% 
+        plot_grid(plotlist = .)
+```
+
+```{r}
+# Examine PCA results (here only showing first 16, but we used 40 for clustering)
+print(seurat_integrated[["pca"]], dims = 1:16, nfeatures = 5)
+```
+
+#### ASSIGNING CLUSTER IDENTITIES
+
+```{r}
+# Load same object as from last checkpoint. Repeated here just for ease of access
+load("E://Rossi/Processing/D4D5D6D7/D4D5D6D7counts_final_integrated_clustered.RData") #10.5GB
+```
+
+Plot the UMAP again, for reference
+
+```{r, fig.width=8, fig.height=6}
+# Plot again your clusters on the UMAP, for reference
+
+Idents(seurat_integrated) <- "integrated_snn_res.0.8"
+
+plot <- DimPlot(seurat_integrated,
+        reduction = "umap",
+        label = F,
+        label.size = 6,
+        pt.size = 0.9,
+        ) +labs(title = "SBR Gastruloids t=96h-168h")
+ 
+LabelClusters(plot = plot, id = "ident", color = "black", size = 3)
+```
+
+A- EXPLORING KNOWN CELL TYPE MARKERS
+
+```{r, fig.width=8, fig.height=6}
+
+# Select the RNA counts slot to be the default assay
+DefaultAssay(seurat_integrated) <- "RNA"
+
+# Normalize RNA data for visualization purposes
+seurat_integrated <- NormalizeData(seurat_integrated, verbose = FALSE)
+
+#plot markers
+plotted_gene = c("Foxa2", "Sox17", "Cdh1", "Eomes","T", "Epcam")
+
+for (i in seq(length(plotted_gene))) {
+ plot <- FeaturePlot(seurat_integrated, 
+                     reduction = "umap", 
+                     features = plotted_gene[i], 
+                     cols = c("gray85", "black"), 
+                     max.cutoff = 1,
+                     pt.size = 1,
+                     order = TRUE)+
+    labs(title = plotted_gene[i])+ 
+    theme(plot.title = element_text(size=40))
+ print(plot)
+}
+```
+
+
+```{r, fig.width=8, fig.height=6}
+#plot markers of AP position
+plotted_gene = c("Nkx2.3", "Isl1", "Otx2", "Foxa3","Cdx2", "Tlx2")
+
+for (i in seq(length(plotted_gene))) {
+ plot <- FeaturePlot(seurat_integrated, 
+                     reduction = "umap", 
+                     features = plotted_gene[i], 
+                     cols = c("gray85", "black"), 
+                     max.cutoff = 1,
+                     pt.size = 1,
+                     order = TRUE)+
+    labs(title = plotted_gene[i])+ 
+    theme(plot.title = element_text(size=40))
+ print(plot)
+}
+```
+
+```{r, fig.width=8, fig.height=6}
+
+# plot nowotschin AP genes
+plotted_gene = c("Nkx2-1", "Pax8", "Nkx2-5", "Nkx2-3","Isl1", "Otx2", "Prrx2", "Six1", "Foxg1", "Irx3", "Hoxb1", "Meis2", "Gata6", "Foxa3", "Cdx2", "Hoxa7", "Hoxb8", "Hoxc8", "Hoxc9", "Tlx2")
+
+
+plotted_color =  colorRampPalette(brewer.pal(20,"Spectral"))(length(plotted_gene))
+
+for (i in seq(length(plotted_gene))) {
+ plot <- FeaturePlot(seurat_integrated, 
+                     reduction = "umap", 
+                     features = plotted_gene[i], 
+                     cols = c("gray85",plotted_color[i]),#cols = c("gray85", "black"), 
+                     max.cutoff = 1,
+                     pt.size = 1,
+                     order = TRUE)+
+    labs(title = plotted_gene[i])+ 
+    theme(plot.title = element_text(size=40))
+ print(plot)
+}
+```
+
+
+B- FINDING MARKERS FOR EACH CLUSTER
+
+
+```{r}
+# to find markers of clusters:
+
+markers_r0.8 <- FindAllMarkers(object = seurat_integrated, 
+                          only.pos = TRUE,
+                          logfc.threshold = 0.25) 
+
+
+#The FindAllMarkers function above was run on the HPC cluster. Load output:
+#load("D://Rossi/Processing/D4D5D6D7/D4D5D6D7_allmarkers_r0.8.RData") #loads file "markers_r0.8"
+
+#add gene annotations to each row
+markers_r0.8 <- markers_r0.8 %>% 
+                          left_join(y = unique(annotations[, c("gene_name", "description")]),
+                          by = c("gene" = "gene_name"))
+
+#calculate delta (as the difference between pct1 and pct2), and sort by that factor
+markers_r0.8 <- markers_r0.8 %>% 
+  mutate(delta = (pct.1 - pct.2)) %>%
+   dplyr::arrange(-delta) 
+
+#save annotated list of markers
+#save(markers_r0.8, file="D://Rossi/Processing/D4D5D6D7/D4D5D6D7_allmarkers_r0.8.RData") #will overwrite previous instance
+#load("E://Rossi/Processing/D4D5D6D7/D4D5D6D7_allmarkers_r0.8.RData") #loads file "markers_r0.8"
+
+#extract markers for single clusters
+markers_r0.8_00 <- subset(markers_r0.8, cluster == "0") %>% dplyr::arrange(-delta)
+markers_r0.8_01 <- subset(markers_r0.8, cluster == "1") %>% dplyr::arrange(-delta) 
+markers_r0.8_02 <- subset(markers_r0.8, cluster == "2") %>% dplyr::arrange(-delta) 
+markers_r0.8_03 <- subset(markers_r0.8, cluster == "3") %>% dplyr::arrange(-delta) 
+markers_r0.8_04 <- subset(markers_r0.8, cluster == "4") %>% dplyr::arrange(-delta) 
+markers_r0.8_05 <- subset(markers_r0.8, cluster == "5") %>% dplyr::arrange(-delta) 
+markers_r0.8_06 <- subset(markers_r0.8, cluster == "6") %>% dplyr::arrange(-delta) 
+markers_r0.8_07 <- subset(markers_r0.8, cluster == "7") %>% dplyr::arrange(-delta) 
+markers_r0.8_08 <- subset(markers_r0.8, cluster == "8") %>% dplyr::arrange(-delta) 
+markers_r0.8_09 <- subset(markers_r0.8, cluster == "9") %>% dplyr::arrange(-delta) 
+markers_r0.8_10 <- subset(markers_r0.8, cluster == "10") %>% dplyr::arrange(-delta) 
+markers_r0.8_11 <- subset(markers_r0.8, cluster == "11") %>% dplyr::arrange(-delta) 
+markers_r0.8_12 <- subset(markers_r0.8, cluster == "12") %>% dplyr::arrange(-delta) 
+markers_r0.8_13 <- subset(markers_r0.8, cluster == "13") %>% dplyr::arrange(-delta) 
+markers_r0.8_14 <- subset(markers_r0.8, cluster == "14") %>% dplyr::arrange(-delta) 
+markers_r0.8_15 <- subset(markers_r0.8, cluster == "15") %>% dplyr::arrange(-delta) 
+markers_r0.8_16 <- subset(markers_r0.8, cluster == "16") %>% dplyr::arrange(-delta) 
+markers_r0.8_17 <- subset(markers_r0.8, cluster == "17") %>% dplyr::arrange(-delta) 
+markers_r0.8_18 <- subset(markers_r0.8, cluster == "18") %>% dplyr::arrange(-delta) 
+markers_r0.8_19 <- subset(markers_r0.8, cluster == "19") %>% dplyr::arrange(-delta) 
+markers_r0.8_20 <- subset(markers_r0.8, cluster == "20") %>% dplyr::arrange(-delta) 
+markers_r0.8_21 <- subset(markers_r0.8, cluster == "21") %>% dplyr::arrange(-delta) 
+
+  
+#When looking at the output, we suggest looking for markers with large differences in expression between pct.1 and pct.2 and larger fold changes. For instance if pct.1 = 0.90 and pct.2 = 0.80, it may not be as exciting of a marker. However, if pct.2 = 0.1 instead, the bigger difference would be more convincing. Also, of interest is if the majority of cells expressing the marker is in my cluster of interest. If pct.1 is low, such as 0.3, it may not be as interesting. Both of these are also possible parameters to include when running the function, as described above.  
+
+```
+
+
+C- FINDING MARKERS DIFFERENTIATING CLOSE CLUSTERS
+
+```{r}
+#Determine markers separating two clusters
+# Determine differentiating markers for mesoderm cells
+
+DE_04vs13 <- FindMarkers(seurat_integrated,
+                          ident.1 = 04,
+                          ident.2 = 13)                 
+
+# Add gene symbols to the DE table
+DE_04vs13   <- DE_04vs13   %>%
+  rownames_to_column(var = "gene") %>%
+  left_join(y = unique(annotations[, c("gene_name", "description")]),
+             by = c("gene" = "gene_name"))
+
+# Reorder columns and sort by padj      
+DE_04vs13   <- DE_04vs13  [, c(1, 3:5,2,6:7)] %>% 
+                  mutate(delta = (pct.1 - pct.2)) %>%
+                      dplyr::arrange(-delta) 
+
+
+
+#save(DE_04vs13, file="D://Rossi/Processing/D4D5D6D7/DE_markers_res0.8_04vs13.RData")
+#load("E://Rossi/Processing/D4D5D6D7/DE_markers_res0.8_04vs13.RData")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#### PREPRINT FIGURES
+Below are self-contained chuncks of codes to reproduce the figures (or elements of figures) published on the preprint (Vianello and Lutolf, "In vitroendoderm emergence andself-organisation in the absence ofextraembryonic tissues and embryonicarchitecture")
+
+```{r}
+# Load processed Seurat object (Gastruloids at all timepoints), as generated by following the code above.
+#Repeated here just for ease of access
+load("E://Rossi/Processing/D4D5D6D7/D4D5D6D7counts_final_integrated_clustered.RData") #10.5GB
+```
+
+#####UMAP with endoderm clusters in yellow (Fig7A, top)
+```{r, fig.width=8, fig.height=6}
+# Plot again your clusters on the UMAP, for reference
+
+Idents(seurat_integrated) <- "integrated_snn_res.0.8"
+
+colors = c("gray65", "gray65", "gray75", "gray65", "goldenrod3", "gray55", "gray65",
+           "gray55", "gray75", "gray55","gray55", "gray75", "gray75", "goldenrod1",
+           "gray65", "gray75","gray65", "gray75", "gray75","gray65", "gray75", 
+           "gray75")
+
+
+
+plot <- DimPlot(seurat_integrated,
+        reduction = "umap",
+        label = F,
+        label.size = 6,
+        pt.size = 0.9,
+        cols = colors,
+        ) +labs(title = "SBR Gastruloids t=96h-168h")
+ 
+LabelClusters(plot = plot, id = "ident", color = "black", size = 3)
+```
+
+##### FeaturePlots of canonical endoderm markers (Fig7A,bottom)
+
+```{r, fig.width=8, fig.height=6}
+
+# Select the RNA counts slot to be the default assay
+DefaultAssay(seurat_integrated) <- "RNA"
+
+# Normalize RNA data for visualization purposes
+seurat_integrated <- NormalizeData(seurat_integrated, verbose = FALSE)
+
+#plot markers
+plotted_gene = c("Foxa2", "Sox17", "Cdh1", "Eomes","T", "Epcam")
+
+for (i in seq(length(plotted_gene))) {
+ plot <- FeaturePlot(seurat_integrated, 
+                     reduction = "umap", 
+                     features = plotted_gene[i], 
+                     cols = c("gray85", "black"), 
+                     max.cutoff = 1,
+                     pt.size = 1,
+                     order = TRUE)+
+    labs(title = plotted_gene[i])+ 
+    theme(plot.title = element_text(size=40))
+ print(plot)
+}
+```
+
+##### 3D UMAP with endoderm clusters in yellow (Fig7B)
+
+```{r}
+# Interacive multimodal 3D UMAP plotting of scRNA sequencing datasets
+# The following is a length of code generated to create nice 
+# 3D UMAP plots of seurat v3.0.0-v3.1.1 objects utilizing the visualization 
+# package plot_ly
+
+# R v3.5.3 (x64 bit) and RStudio v1.2.1335 (x64 bit) were used for running this code :)
+
+# Seurat is a multimodal single Cell RNA seq analysis algorithm created by
+# The Satija Lab. For more information please see: https://satijalab.org/seurat/
+
+# Contributors (by their Github handles):
+# @Dragonmasterx87 (Dept. of Cell Biology, UM)
+# @msaadsadiq (Dept. of Electrical and Computer Engineering, UM)
+
+# Load plot_ly
+library(plotly)
+library(scales)
+
+# Construct a dataframe using data from your pre-clustered Seurat v3.1.1 object
+# Here 'seurat_clusters' is list of numeric cluster identities, you can find it here: yourseuratobject[["seurat_cluster"]], 
+# or yourseuratobject$seurat_clusters, where 'yourseuratobject' is a Seurat object created with Seurat v3.1.1 (works for v3.0.0 as well)
+#yourseuratobject <- ThisIsWhateverYourSeuratObjectIsEvenIfItsIntegrated
+load("D://Rossi/Processing/D4D5D6D7/D4D5D6D7counts_final_integrated_clustered.RData")
+
+
+# Re-run UMAPs that you have accurate calculations for all UMAP(s)
+seurat_integrated <- RunUMAP(seurat_integrated,
+                            dims = 1:40,
+                            n.components = 3L)
+
+# Extract tSNE information from Seurat Object
+umap_1 <- seurat_integrated[["umap"]]@cell.embeddings[,1]
+umap_2 <- seurat_integrated[["umap"]]@cell.embeddings[,2]
+umap_3 <- seurat_integrated[["umap"]]@cell.embeddings[,3]
+
+# Visualize what headings are called so that you can extract them to form a dataframe
+#Embeddings(object = seurat_integrated, reduction = "umap") #to show columns are called UMAP_1/2/3
+
+
+# Prepare a dataframe for cell plotting
+plot.data <- FetchData(object = seurat_integrated, vars = c("UMAP_1", "UMAP_2", "UMAP_3", "integrated_snn_res.0.8"))
+
+# Make a column of row name identities (these will be your cell/barcode names)
+plot.data$label <- paste(rownames(plot.data))
+
+
+#save the data for the 3D plot
+save(plot.data, file="D://Rossi/Processing/D4D5D6D7/3D_UMAP_data.RData")
+load("E://Rossi/Processing/D4D5D6D7/3D_UMAP_data.RData")
+
+# Plot your data, in this example my Seurat object had 21 clusters (0-20)
+plot_ly(data = plot.data, 
+        x = ~UMAP_1, y = ~UMAP_2, z = ~UMAP_3, 
+        color = ~integrated_snn_res.0.8, 
+        colors = colors, #hue_pal()(21),
+        type = "scatter3d", 
+        mode = "markers", 
+        marker = list(size = 2, width=2), # controls size of points
+        text=~label, #This is that extra column we made earlier for which we will use for cell ID
+        hoverinfo="text") #When you visualize your plotly object, hovering your mouse pointer over a point shows cell names
+
+```
+
+notice how the endoderm/gut cluster 4 is connected to cluster 5 (surface ectoderm), and notably cluster 1 (notochord) which was not apparent in the 2D UMAP
+
+##### Barplot of timepoints per cluster (Fig7C)
+
+```{r, fig.width=6, fig.height=5}
+##MAKING THE TABLE OF TIMEPOINTS PER CLUSTER
+
+# Get number of cells per cluster and per sample of origin
+df <- table(seurat_integrated@meta.data$integrated_snn_res.0.8, seurat_integrated@meta.data$orig.ident)
+df
+
+new_df <- data.frame("cluster" = c("1.cluster 13", "1.cluster 13","1.cluster 13","1.cluster 13",
+                                   "2.cluster 04", "2.cluster 04", "2.cluster 04", "2.cluster 04"),
+                 "cell_number" = c(346, 386, 309, 136, 196, 752, 476, 452) ,
+                 "timepoint" = c("D4", "D5", "D6", "D7"))
+new_df
+
+p <- ggplot(data=new_df, aes(x=cluster, y=cell_number, fill=timepoint)) +
+  geom_bar(stat="identity",color="black", width=0.7, position=position_dodge())+ ggtitle("Representation of each timepoint in the endoderm clusters") 
+
+p+scale_fill_manual(values=c("skyblue1", "steelblue2", "steelblue3", "steelblue4"))+ theme_classic()
+```
+
+##### FeaturePlots of AP endoderm markers (Fig7D)
+
+```{r, fig.width=8, fig.height=6}
+#plot markers of AP position
+plotted_gene = c("Nkx2.3", "Isl1", "Otx2", "Foxa3","Cdx2", "Tlx2")
+
+for (i in seq(length(plotted_gene))) {
+ plot <- FeaturePlot(seurat_integrated, 
+                     reduction = "umap", 
+                     features = plotted_gene[i], 
+                     cols = c("gray85", "black"), 
+                     max.cutoff = 1,
+                     pt.size = 1,
+                     order = TRUE)+
+    labs(title = plotted_gene[i])+ 
+    theme(plot.title = element_text(size=40))
+ print(plot)
+}
+```
+
+##### FeaturePlots of AP endoderm markers (all) (FigS1)
+
+```{r, fig.width=8, fig.height=6}
+
+# plot nowotschin AP genes
+plotted_gene = c("Nkx2-1", "Pax8", "Nkx2-5", "Nkx2-3","Isl1", "Otx2", "Prrx2", "Six1", "Foxg1", "Irx3", "Hoxb1", "Meis2", "Gata6", "Foxa3", "Cdx2", "Hoxa7", "Hoxb8", "Hoxc8", "Hoxc9", "Tlx2")
+
+
+plotted_color =  colorRampPalette(brewer.pal(20,"Spectral"))(length(plotted_gene))
+
+for (i in seq(length(plotted_gene))) {
+ plot <- FeaturePlot(seurat_integrated, 
+                     reduction = "umap", 
+                     features = plotted_gene[i], 
+                     cols = c("gray85",plotted_color[i]),#cols = c("gray85", "black"), 
+                     max.cutoff = 1,
+                     pt.size = 1,
+                     order = TRUE)+
+    labs(title = plotted_gene[i])+ 
+    theme(plot.title = element_text(size=40))
+ print(plot)
+}
+```
+
+#####UMAP with endoderm clusters in blue and red (Fig8B, inset)
+
+```{r, fig.width=8, fig.height=6}
+# Plot again your clusters on the UMAP, for reference
+
+colors = c("gray65", "gray65", "gray75", "gray65", "indianred1", "gray55", "gray65",
+           "gray55", "gray75", "gray55","gray55", "gray75", "gray75", "deepskyblue",
+           "gray65", "gray75","gray65", "gray75", "gray75","gray65", "gray75", 
+           "gray75")
+
+
+
+plot <- DimPlot(seurat_integrated,
+        reduction = "umap",
+        label = F,
+        label.size = 6,
+        pt.size = 0.9,
+        cols = colors,
+        ) +labs(title = "SBR Gastruloids t=96h-168h")
+ 
+LabelClusters(plot = plot, id = "ident", color = "black", size = 3)
+```
+
+##### FeaturePlot of Pax9 expression (Fig8D)
+
+```{r, fig.width=8, fig.height=6}
+
+# Select the RNA counts slot to be the default assay
+DefaultAssay(seurat_integrated) <- "RNA"
+
+# Normalize RNA data for visualization purposes
+seurat_integrated <- NormalizeData(seurat_integrated, verbose = FALSE)
+
+
+plot <- FeaturePlot(seurat_integrated, 
+                     reduction = "umap", 
+                     features = "Pax9", 
+                     cols = c("gray85", "black"), 
+                     max.cutoff = 1,
+                     pt.size = 1,
+                     order = TRUE)+
+    labs(title = "Pax9")+ 
+    theme(plot.title = element_text(size=40))
+
+print(plot)
+
+```
+
+
+
+
+
+```{r}
+sessionInfo()
+```
+
+
+
+_RNotebook by Stefano Vianello (EPFL)_
+
+stefano.vianello@epfl.ch 
+
+<a rel="license" href="http://creativecommons.org/licenses/by-nc-sa/4.0/"><img alt="Creative Commons License" style="border-width:0" src="https://i.creativecommons.org/l/by-nc-sa/4.0/88x31.png" /></a><br />This work is licensed under a <a rel="license" href="http://creativecommons.org/licenses/by-nc-sa/4.0/">Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License</a>.
